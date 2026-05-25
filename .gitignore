@@ -1,0 +1,16 @@
+.env
+*.log
+etl_auto.log
+etl_loop.log
+data/
+superset_home/
+.idea/
+.vscode/
+__pycache__/
+*.pyc
+.DS_Store
+.trino_history
+*.tmp
+*.pid
+*.swp
+docker/trino/catalog/hive.properties

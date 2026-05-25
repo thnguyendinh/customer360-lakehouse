@@ -1,0 +1,105 @@
+version: '3.8'
+
+services:
+  spark:
+    image: apache/spark:3.5.1
+    container_name: c360-spark
+    environment:
+      - SPARK_MODE=master
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+    volumes:
+      - ./scripts:/scripts
+    command: ["bash", "-c", "start-master.sh && tail -f /dev/null"]
+    networks:
+      - c360_net
+
+  fake-generator:
+    image: python:3.10-slim
+    container_name: c360-fake-generator
+    env_file: .env
+    volumes:
+      - ./scripts:/scripts
+    working_dir: /scripts
+    command: ["python3", "generate_fake_data.py"]
+    restart: unless-stopped
+    networks:
+      - c360_net
+
+  etl:
+    image: apache/spark:3.5.1
+    container_name: c360-etl
+    env_file: .env
+    depends_on:
+      - spark
+    volumes:
+      - ./scripts:/scripts
+    command: ["python3", "/scripts/etl_pipeline.py"]
+    restart: unless-stopped
+    networks:
+      - c360_net
+
+  superset_db:
+    image: postgres:15-alpine
+    container_name: c360-superset-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: superset
+      POSTGRES_PASSWORD: superset
+      POSTGRES_DB: superset
+    volumes:
+      - superset_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "superset"]
+      interval: 10s
+      retries: 5
+    networks:
+      - c360_net
+
+  superset:
+    build:
+      context: .
+      dockerfile: docker/superset/Dockerfile
+    container_name: c360-superset
+    restart: unless-stopped
+    depends_on:
+      superset_db:
+        condition: service_healthy
+    environment:
+      SUPERSET_SECRET_KEY: 'superset_secret_key_change_me_12345'
+      SQLALCHEMY_DATABASE_URI: postgresql+psycopg2://superset:superset@superset_db/superset
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+    ports:
+      - "8088:8088"
+    command: >
+      sh -c "
+        superset db upgrade &&
+        superset init &&
+        superset fab create-admin --username admin --firstname Admin --lastname User --email admin@customer360.com --password Admin@123 &&
+        gunicorn --bind 0.0.0.0:8088 --workers 2 --timeout 120 'superset.app:create_app()'
+      "
+    networks:
+      - c360_net
+
+  trino:
+    image: trinodb/trino:438
+    container_name: c360_trino
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./docker/trino/catalog:/etc/trino/catalog
+      - trino_data:/data/trino
+    networks:
+      - c360_net
+
+volumes:
+  trino_data:
+  superset_db:
+
+networks:
+  c360_net:
+    driver: bridge

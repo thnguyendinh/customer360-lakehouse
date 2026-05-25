@@ -1,0 +1,224 @@
+version: "3.9"
+
+networks:
+  c360_net:
+    driver: bridge
+
+volumes:
+  airflow_db:
+
+  generator:
+    build:
+      context: .
+      dockerfile: docker/generator/Dockerfile
+    container_name: c360_generator
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - S3_BUCKET=${S3_BUCKET}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}
+    volumes:
+      - ./src/scripts:/app/scripts
+      - ./data/logs:/app/logs
+    command: python scripts/generate_data.py --backfill --interval 300
+    networks:
+      - c360_net
+
+  spark:
+    user: root
+    build:
+      context: .
+      dockerfile: docker/spark/Dockerfile
+    container_name: c360_spark
+    restart: "no"
+    env_file: .env
+    environment:
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}
+      - S3_BUCKET=${S3_BUCKET}
+      - SPARK_MODE=client
+    volumes:
+      - ./src/spark_jobs:/app/spark_jobs
+      - ./src/config:/app/config
+      - spark_logs:/app/logs
+    networks:
+      - c360_net
+
+  airflow_db:
+    image: postgres:15-alpine
+    container_name: c360_airflow_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+    networks:
+      - c360_net
+
+  airflow_init:
+    build:
+      context: .
+      dockerfile: docker/airflow/Dockerfile
+    container_name: c360_airflow_init
+    depends_on:
+      airflow_db:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow_db/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      _AIRFLOW_DB_UPGRADE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_WWW_USER_USERNAME}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_WWW_USER_PASSWORD}
+    volumes:
+      - ./src/dags:/opt/airflow/dags
+      - ./data/logs:/opt/airflow/logs
+    command: >
+      bash -c "
+        airflow db upgrade &&
+        airflow users create
+          --username $$_AIRFLOW_WWW_USER_USERNAME
+          --password $$_AIRFLOW_WWW_USER_PASSWORD
+          --firstname Admin --lastname User
+          --role Admin --email admin@c360.com &&
+        echo 'Airflow init done'
+      "
+    networks:
+      - c360_net
+
+  airflow_webserver:
+    build:
+      context: .
+      dockerfile: docker/airflow/Dockerfile
+    container_name: c360_airflow_webserver
+    restart: unless-stopped
+    depends_on:
+      airflow_db:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow_db/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
+      S3_BUCKET: ${S3_BUCKET}
+    volumes:
+      - ./src/dags:/opt/airflow/dags
+      - ./src/spark_jobs:/opt/airflow/spark_jobs
+      - ./src/scripts:/opt/airflow/scripts
+      - ./src/config:/opt/airflow/config
+      - ./data/logs:/opt/airflow/logs
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "8080:8080"
+    command: webserver
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      retries: 5
+    networks:
+      - c360_net
+
+  airflow_scheduler:
+    build:
+      context: .
+      dockerfile: docker/airflow/Dockerfile
+    container_name: c360_airflow_scheduler
+    restart: unless-stopped
+    depends_on:
+      airflow_db:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow_db/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
+      S3_BUCKET: ${S3_BUCKET}
+    volumes:
+      - ./src/dags:/opt/airflow/dags
+      - ./src/spark_jobs:/opt/airflow/spark_jobs
+      - ./src/scripts:/opt/airflow/scripts
+      - ./src/config:/opt/airflow/config
+      - ./data/logs:/opt/airflow/logs
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: scheduler
+    networks:
+      - c360_net
+
+  trino:
+    image: trinodb/trino:438
+    container_name: c360_trino
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./docker/trino/catalog:/etc/trino/catalog
+      - trino_data:/data/trino
+    networks:
+      - c360_net
+
+  superset_db:
+    image: postgres:15-alpine
+    container_name: c360_superset_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: superset
+      POSTGRES_PASSWORD: superset
+      POSTGRES_DB: superset
+    volumes:
+      - superset_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "superset"]
+      interval: 10s
+      retries: 5
+    networks:
+      - c360_net
+
+  superset:
+    build:
+      context: .
+      dockerfile: docker/superset/Dockerfile
+    container_name: c360_superset
+    restart: unless-stopped
+    depends_on:
+      superset_db:
+        condition: service_healthy
+    environment:
+      SUPERSET_SECRET_KEY: 'superset_secret_key_change_me'
+      SQLALCHEMY_DATABASE_URI: postgresql+psycopg2://superset:superset@superset_db/superset
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+    ports:
+      - "8088:8088"
+    command: >
+      sh -c "
+        superset db upgrade &&
+        superset init &&
+        superset fab create-admin \
+          --username admin \
+          --firstname Admin \
+          --lastname User \
+          --email admin@customer360.com \
+          --password Admin@123 &&
+        gunicorn --bind 0.0.0.0:8088 --workers 2 --timeout 120 --limit-request-line 0 'superset.app:create_app()'
+      "
+    networks:
+      - c360_net
